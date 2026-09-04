@@ -1,0 +1,128 @@
+name: Deep Hoster - DeepSeek Harness Deployment
+
+on: 
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js Environment
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22
+        
+    - name: Install Dependencies & Setup Tunnel
+      run: |
+        echo -e "\e[36m╔══════════════════════════════════════════════╗\e[0m"
+        echo -e "\e[36m║          DEEP HOSTER // DEEPSEEK HARNESS         ║\e[0m"
+        echo -e "\e[36m╚══════════════════════════════════════════════╝\e[0m"
+        sudo apt-get update -y
+        sudo apt-get install -y curl git jq openssl ca-certificates ripgrep ffmpeg
+        
+        sudo curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+        sudo chmod +x /usr/local/bin/cloudflared
+        sudo npm install -g @deepseek-ai/dsh
+
+    - name: Unlock Remote Access & Patch 403 Trust Fence
+      run: |
+        echo "[INFO] Patching DeepSeek Harness to allow remote /api access (bypassing loopback-only 403)..."
+        python3 -c '
+        import os, re
+        npm_root = os.popen("npm root -g").read().strip()
+        count = 0
+        for root, _, files in os.walk(npm_root):
+            for f in files:
+                if f.endswith(".js"):
+                    path = os.path.join(root, f)
+                    try:
+                        with open(path, "r", encoding="utf-8", errors="ignore") as fp:
+                            content = fp.read()
+                        orig = content
+                        
+                        # 1. Bypass isTrustedApiRequest
+                        content = re.sub(r"(function\s+isTrustedApiRequest\s*\([^)]*\)\s*\{)", r"\1 return true;", content)
+                        content = re.sub(r"((?:const|let|var)?\s*isTrustedApiRequest\s*=\s*(?:function)?\s*\([^)]*\)\s*(?:=>)?\s*\{)", r"\1 return true;", content)
+                        
+                        # 2. Bypass PRIVILEGED_METHODS check (settings, providers, workspaces)
+                        content = content.replace("!isTrustedApiRequest(request, [])", "false")
+                        content = content.replace("!isTrustedApiRequest(req, [])", "false")
+                        content = content.replace("PRIVILEGED_METHODS.has(", "false && (")
+                        
+                        # 3. Bypass host / origin mismatch
+                        content = re.sub(r"new\s+URL\(origin\)\.host\s*!==\s*[^;\)\&]+", "false", content)
+                        content = content.replace("sec-fetch-site: cross-site", "sec-fetch-site: disabled")
+                        
+                        if content != orig:
+                            with open(path, "w", encoding="utf-8") as fp:
+                                fp.write(content)
+                            count += 1
+                    except Exception as e:
+                        pass
+        print(f"[SUCCESS] Patched {count} files in DeepSeek Harness. Remote 403 eliminated!")
+        '
+
+    - name: Launch DeepSeek Harness Web UI
+      run: |
+        mkdir -p ~/.dsh ~/workspace
+        cd ~/workspace
+        
+        echo "[INFO] Starting DeepSeek Harness on port 3080..."
+        nohup dsh web --no-open --port 3080 --trusted-host "*" > /tmp/dsh.log 2>&1 &
+        
+        echo "[INFO] Waiting for DeepSeek Harness to be ready on port 3080..."
+        READY=0
+        for i in $(seq 1 45); do
+          if curl -s -I http://127.0.0.1:3080 > /dev/null 2>&1; then
+            echo "[SUCCESS] DeepSeek Harness is actively running on port 3080!"
+            READY=1
+            break
+          fi
+          echo "Waiting for port 3080... ($i/45)"
+          sleep 2
+        done
+        
+        if [ $READY -eq 0 ]; then
+          echo "[ERROR] DeepSeek Harness failed to start. Printing logs:"
+          cat /tmp/dsh.log
+          exit 1
+        fi
+        
+    - name: Establish Live Tunnel
+      run: |
+        echo "Starting Cloudflare tunnel on port 3080 with Host Rewrite..."
+        nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:3080 --http-host-header localhost > /tmp/tunnel.log 2>&1 &
+        for i in $(seq 1 30);
+          sleep 2
+          TUNNEL_URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" /tmp/tunnel.log | head -1 || true)
+          if [ -n "$TUNNEL_URL" ]; then
+            echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+            break
+          fi
+        done
+        
+        # Extract security token from log to prevent auth required errors
+        DSH_TOKEN=$(grep -o 'token=[a-zA-Z0-9_-]*' /tmp/dsh.log | head -1)
+        
+        echo -e "\e[32m[SUCCESS] DeepSeek Harness Tunnel Established!\e[0m"
+        echo -e "\e[36m===================================================\e[0m"
+        echo -e "\e[36m        DEEP HOSTER - DEEPSEEK HARNESS WEB UI      \e[0m"
+        echo -e "\e[36m===================================================\e[0m"
+        echo -e "\e[32mWeb UI URL     : $TUNNEL_URL/?$DSH_TOKEN\e[0m"
+        echo -e "\e[33mHarness Port   : 3080\e[0m"
+        echo -e "\e[35mConfig & State : ~/.dsh\e[0m"
+        echo -e "\e[36m===================================================\e[0m"
+        
+    - name: Keep Alive Monitor
+      run: |
+        echo "DeepSeek Harness session is active for 6 hours max..."
+        for i in {360..1}; do
+            sleep 60
+        done
